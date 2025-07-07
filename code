@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SiLU(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_ch, eps=1e-6)
+        self.act1 = SiLU()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        
+        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_ch, eps=1e-6)
+        self.act2 = SiLU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+        
+        if in_ch != out_ch:
+            self.nin_shortcut = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        else:
+            self.nin_shortcut = nn.Identity()
+
+    def forward(self, x):
+        h = self.conv1(self.act1(self.norm1(x)))
+        h = self.conv2(self.dropout(self.act2(self.norm2(h))))
+        return h + self.nin_shortcut(x)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, channels, num_heads=1):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=channels, eps=1e-6)
+        self.q = nn.Conv1d(channels, channels, 1)
+        self.k = nn.Conv1d(channels, channels, 1)
+        self.v = nn.Conv1d(channels, channels, 1)
+        self.proj_out = nn.Conv1d(channels, channels, 1)
+        self.num_heads = num_heads
+
+    def forward(self, x):
+        # x: (B, C, H, W) → (B, C, N)
+        b, c, h, w = x.shape
+        n = h * w
+        x_flat = self.norm(x).view(b, c, n)
+        
+        q = self.q(x_flat).view(b, self.num_heads, c // self.num_heads, n)
+        k = self.k(x_flat).view(b, self.num_heads, c // self.num_heads, n)
+        v = self.v(x_flat).view(b, self.num_heads, c // self.num_heads, n)
+        
+        attn = torch.einsum('bhcn,bhcm->bhnm', q, k) * (1.0 / (c // self.num_heads) ** 0.5)
+        attn = torch.softmax(attn, dim=-1)
+        
+        h_flat = torch.einsum('bhnm,bhcm->bhcn', attn, v)
+        h_flat = h_flat.contiguous().view(b, c, n)
+        h_out = self.proj_out(h_flat)
+        
+        return x + h_out.view(b, c, h, w)
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_ch):
+        super().__init__()
+        self.op = nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.op(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_ch):
+        super().__init__()
+        self.op = nn.ConvTranspose2d(in_ch, in_ch, kernel_size=4, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.op(x)
+
+
+class UNet(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        base_channels=128,
+        channel_mults=(1, 2, 4, 8),
+        num_res_blocks=2,
+        attn_resolutions=(16,),
+        dropout=0.0
+    ):
+        super().__init__()
+        # Input conv
+        self.init_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        
+        # Downsampling
+        self.down_blocks = nn.ModuleList()
+        ch = base_channels
+        for i, mult in enumerate(channel_mults):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks):
+                self.down_blocks.append(ResidualBlock(ch, out_ch, dropout))
+                ch = out_ch
+                if 256 // (2 ** i) in attn_resolutions:
+                    self.down_blocks.append(AttentionBlock(ch))
+            if i != len(channel_mults) - 1:
+                self.down_blocks.append(Downsample(ch))
+        
+        # Bottleneck
+        self.mid_block1 = ResidualBlock(ch, ch, dropout)
+        self.mid_attn   = AttentionBlock(ch)
+        self.mid_block2 = ResidualBlock(ch, ch, dropout)
+        
+        # Upsampling
+        self.up_blocks = nn.ModuleList()
+        for i, mult in reversed(list(enumerate(channel_mults))):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks + 1):
+                self.up_blocks.append(ResidualBlock(ch * 2, out_ch, dropout))
+                ch = out_ch
+                if 256 // (2 ** i) in attn_resolutions:
+                    self.up_blocks.append(AttentionBlock(ch))
+            if i != 0:
+                self.up_blocks.append(Upsample(ch))
+        
+        # Output
+        self.out_norm = nn.GroupNorm(num_groups=32, num_channels=ch, eps=1e-6)
+        self.out_act  = SiLU()
+        self.out_conv = nn.Conv2d(ch, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        h = self.init_conv(x)
+        skip_connections = []
+        # Down
+        for layer in self.down_blocks:
+            h = layer(h)
+            # store after each ResidualBlock (before downsample)
+            if isinstance(layer, ResidualBlock):
+                skip_connections.append(h)
+        # Bottleneck
+        h = self.mid_block1(h)
+        h = self.mid_attn(h)
+        h = self.mid_block2(h)
+        # Up
+        for layer in self.up_blocks:
+            if isinstance(layer, ResidualBlock):
+                # concatenate with skip
+                skip = skip_connections.pop()
+                h = torch.cat([h, skip], dim=1)
+            h = layer(h)
+        # Output
+        h = self.out_conv(self.out_act(self.out_norm(h)))
+        return h
+
+
+if __name__ == "__main__":
+    # example usage
+    model = UNet(
+        in_channels=3,
+        base_channels=128,
+        channel_mults=(1, 2, 4, 8),
+        num_res_blocks=2,
+        attn_resolutions=(16, 8),
+        dropout=0.1
+    )
+    x = torch.randn(4, 3, 256, 256)
+    out = model(x)
+    print("Output shape:", out.shape)  # should be (4, 3, 256, 256)
